@@ -1,3 +1,3 @@
-A client that authenticates and lists media using an Emby or Jellyfin media servers.
+A Delphi client that Authenticates and Lists Media using an Emby or Jellyfin media servers.
 
 Very early code.
