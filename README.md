@@ -6,4 +6,4 @@ The following actions are supported:
 2. Listing the media library's available collections/folders.
 3. Listing the contents of collections / media folders.
 4. Constructing a playable stream URL derived from an ItemID extracted from previously listed content.
-5. Caching the result based for a specified number of days.
+5. Caching the result for a specified number of days.
