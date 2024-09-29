@@ -1,4 +1,4 @@
-The Delphi helper functions used by Zoom Player to communicate with Emby and Jellyfin media servers.
+The Delphi helper functions used by Zoom Player to communicate with Plex, Emby and Jellyfin media servers.
 
 The following functions are supported:
 
