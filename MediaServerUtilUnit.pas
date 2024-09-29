@@ -9,10 +9,10 @@ interface
 uses classes;
 
 
-function  MediaServerAuthenticate(const ServerURL : String; const ServerType : Integer; const Username, Password: string; out sToken, sID : string): Boolean;
-procedure MediaServerGetAvailableCollectionIDs(const ServerURL : String; const ServerType : Integer; const UserId, AccessToken: string; itemList : TList; IgnoreCache : Boolean);
-procedure MediaServerGetMediaFromParentID(const ServerURL : String; const ServerType : Integer; const UserId, ParentID, AccessToken : String; itemList : TList; IgnoreCache : Boolean);
-function  MediaServerGetMediaStreamInfo(const ServerURL : String; const ServerType : Integer; const UserId, ItemID, AccessToken : String) : String;
+function  MediaServerAuthenticate(ServerURL : String; const ServerType : Integer; const Username, Password: string; out sToken, sID : string): Boolean;
+procedure MediaServerGetAvailableCategoryIDs(ServerURL : String; const ServerType : Integer; const UserId, AccessToken: string; itemList : TList; IgnoreCache : Boolean);
+procedure MediaServerGetMediaFromParentID(ServerURL : String; const ServerType : Integer; const UserId, ParentID, AccessToken : String; itemList : TList; IgnoreCache : Boolean);
+function  MediaServerGetMediaStreamInfo(ServerURL : String; const ServerType : Integer; const UserId, ItemID, AccessToken : String) : String;
 
 function  MediaServerURLLoadCache(sURL : String; CacheDuration : Integer) : String;
 procedure MediaServerURLSaveCache(sURL : String; const sData : String);
@@ -27,6 +27,9 @@ const
 
   drTypeCollection       = 0;
   drTypeMedia            = 1;
+
+  plexPort               : Integer = 32400;
+  plexClientID           : String = '11c32164-ec12-9027-b9c4-4f94e6af6f0e';
 
 type
   TMediaServerCollectionRecord =
@@ -80,7 +83,7 @@ implementation
 
 
 uses
-  Windows, SysUtils, Dialogs, WinInet, tntsysutils, tntclasses, ZPVars, General_Txt, Debugunit, superobject, mainunit, general_func, parseunit, md5;
+  Windows, SysUtils, StrUtils, Dialogs, WinInet, tntsysutils, tntclasses, ZPVars, General_Txt, Debugunit, superobject, mainunit, general_func, parseunit, md5, base64;
 
 
 // Helper function to get error message
@@ -198,7 +201,7 @@ begin
 end;
 
 
-function MediaServerAuthenticate(const ServerURL : String; const ServerType : Integer; const Username, Password: string; out sToken, sID : string): Boolean;
+function MediaServerAuthenticate(ServerURL : String; const ServerType : Integer; const Username, Password: string; out sToken, sID : string): Boolean;
 var
   oJSON              : ISuperObject;
   hInet              : HINTERNET;
@@ -224,6 +227,13 @@ var
 
 begin
   {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','MediaServerAuthenticate (before)');{$ENDIF}
+
+  If (ServerType = mediaServerPlex) then
+  Begin
+    // Plex authentication is performed on Plex's server and not the local server
+    ServerURL := 'https://plex.tv/users/sign_in.json';
+  End;
+
   Result  := False;
   sToken  := '';
   sID     := '';
@@ -263,15 +273,14 @@ begin
       Exit;
     End;
 
-    If (URLPath = '') or (URLPath[Length(URLPath)] <> '/') then
-      URLPath := URLPath + '/';
-
     // *********************************************
     // *             Authenticate Path             *
     // *********************************************
     Case ServerType of
       mediaServerEmby :
       Begin
+        If (URLPath = '') or (URLPath[Length(URLPath)] <> '/') then
+          URLPath := URLPath + '/';
         URLPath  := URLPath + 'emby/Users/AuthenticateByName';
         sHeaders := 'X-Emby-Authorization: MediaBrowser Client="'+AppBase+'", Device="PC", DeviceId="WindowsPC", Version="'+GetZPVersionBase+'"';
       End;
@@ -282,6 +291,14 @@ begin
       End;
       mediaServerPlex :
       Begin
+        sHeaders :=
+          'Authorization: Basic '+Base64EncodeString(username+':'+password)+CRLF+
+          'X-Plex-Client-Identifier: '+plexClientID+CRLF+
+          'X-Plex-Product: '+AppBase+CRLF+
+          'X-Plex-Version: '+GetZPVersionBase+CRLF+
+          'X-Plex-Device: '+GetLocalComputerName+CRLF+
+          'X-Plex-Platform: Windows'+CRLF+
+          'X-Plex-Platform-Version: '+IntToStr(WinVerInfo.dwMajorVersion)+'.'+IntToStr(WinVerInfo.dwMinorVersion)+'.'+IntToStr(WinVerInfo.dwBuildNumber);
       End;
     End;
 
@@ -308,7 +325,17 @@ begin
 
       Try
         // Prepare POST data
-        PostData := Format('{"Username":"%s","Pw":"%s"}', [URLEncodeUTF8(Username), URLEncodeUTF8(Password)]);
+        Case ServerType of
+          mediaServerEmby,
+          mediaServerJellyfin :
+          Begin
+            PostData := Format('{"Username":"%s","Pw":"%s"}', [URLEncodeUTF8(Username), URLEncodeUTF8(Password)]);
+          End;
+          mediaServerPlex :
+          Begin
+            PostData := '';
+          End;
+        End;
         {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','POST data: '+CRLF+PostData+CRLF);{$ENDIF}
 
         // Prepare headers
@@ -330,7 +357,7 @@ begin
         If HttpQueryInfo(hReq, HTTP_QUERY_STATUS_CODE or HTTP_QUERY_FLAG_NUMBER, @StatusCode, StatusCodeSize, Index) then
         Begin
           {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','HTTP Status Code: ' + IntToStr(StatusCode));{$ENDIF}
-          If StatusCode <> 200 then
+          If (StatusCode <> 200) and (StatusCode <> 201) then
           Begin
             // Read and output error response
             ResponseText := '';
@@ -366,30 +393,64 @@ begin
         // *           Authenticate Processing         *
         // *********************************************
         // Extract Token/UserID from response
-        If Pos('"AccessToken":', ResponseText) > 0 then
-        Begin
-          oJSON := SO(ResponseText);
 
-          If oJSON <> nil then
+        Case ServerType of
+          mediaServerEmby,
+          mediaServerJellyfin :
           Begin
-            sToken := oJSON.S['AccessToken'];
-            sID    := oJSON.S['User.Id'];
+            If Pos('"AccessToken":', ResponseText) > 0 then
+            Begin
+              oJSON := SO(ResponseText);
 
-            oJSON.Clear(True);
-            oJSON := nil;
+              If oJSON <> nil then
+              Begin
+                sToken := oJSON.S['AccessToken'];
+                sID    := oJSON.S['User.Id'];
 
-            Result := True;
-            {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Authentication successful. Token: ' + sToken);{$ENDIF}
-          End
-            else
-          Begin
-            {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','JSON = NIL');{$ENDIF}
+                oJSON.Clear(True);
+                oJSON := nil;
+
+                Result := True;
+                {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Authentication successful. Token "'+sToken+'", UserID "'+sID+'"');{$ENDIF}
+              End
+                else
+              Begin
+                {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','JSON = NIL');{$ENDIF}
+              End;
+            End
+              else
+            Begin
+              {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Authentication failed. No token found in response.');{$ENDIF}
+            End;
           End;
-        End
-          else
-        Begin
-          {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Authentication failed. No token found in response.');{$ENDIF}
-        End;
+          mediaServerPlex :
+          Begin
+            If Pos('"authToken":', ResponseText) > 0 then
+            Begin
+              oJSON := SO(ResponseText);
+
+              If oJSON <> nil then
+              Begin
+                sToken := oJSON.S['user.authToken'];
+                sID    := oJSON.S['user.id'];
+
+                oJSON.Clear(True);
+                oJSON := nil;
+
+                Result := True;
+                {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Authentication successful. Token "'+sToken+'", UserID "'+sID+'"');{$ENDIF}
+              End
+                else
+              Begin
+                {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','JSON = NIL');{$ENDIF}
+              End;
+            End
+              else
+            Begin
+              {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Authentication failed. No token found in response.');{$ENDIF}
+            End;
+          End;
+        End; // Case
       Finally
         InternetCloseHandle(hReq);
       End;
@@ -403,7 +464,7 @@ begin
 end;
 
 
-procedure MediaServerGetAvailableCollectionIDs(const ServerURL : String; const ServerType : Integer; const UserId, AccessToken: string; itemList : TList; IgnoreCache : Boolean);
+procedure MediaServerGetAvailableCategoryIDs(ServerURL : String; const ServerType : Integer; const UserId, AccessToken: string; itemList : TList; IgnoreCache : Boolean);
 var
   oJSON              : ISuperObject;
   oItems             : ISuperObject;
@@ -431,9 +492,23 @@ var
   URLParts           : TURLComponents;
   nEntry             : PMediaServerCollectionRecord;
   sHeaders           : String;
+  initialCount       : Integer;
 
 begin
   {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','MediaServerGetAvailableItemIDs (before)');{$ENDIF}
+
+  initialCount := itemList.Count;
+
+  If (ServerType = mediaServerPlex) then
+  Begin
+    I := Pos('://',ServerURL);
+    If I = 0 then I := Pos(':',ServerURL) else I := PosEx(':',ServerURL,I+3);
+    If I = 0 then
+    Begin
+      ServerURL := RemoveFrontSlash(ServerURL)+':'+IntToStr(plexPort);
+    End;
+  End;
+
   {$IFDEF TRACEDEBUG}
   DebugMSGFT('c:\log\.MediaServerUtil.txt','Server URL    : '+ServerURL);
   DebugMSGFT('c:\log\.MediaServerUtil.txt','User ID       : '+UserID);
@@ -477,7 +552,6 @@ begin
       Exit;
     End;
 
-    // Ensure URLPath ends with '/emby/Users/AuthenticateByName'
     If (URLPath = '') or (URLPath[Length(URLPath)] <> '/') then
       URLPath := URLPath + '/';
 
@@ -494,12 +568,13 @@ begin
       mediaServerJellyfin :
       Begin
         URLPath  := URLPath + 'UserViews?userId='+UserID;
-        sHeaders := 'Authorization: MediaBrowser Token="'+AccessToken+'"'{+CRLF+
-                    'userId: '+UserID+CRLF+
-                    'includeExternalContent: false'};
+        sHeaders := 'Authorization: MediaBrowser Token="'+AccessToken+'"';
       End;
       mediaServerPlex :
       Begin
+        URLPath  := URLPath + 'library/sections';
+        sHeaders := 'X-Plex-Token: '+AccessToken+CRLF+
+                    'Accept: application/json';
       End;
     End;
 
@@ -578,9 +653,6 @@ begin
           Until BytesRead = 0;
           {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Server response: '+CRLF+ResponseText+CRLF);{$ENDIF}
 
-          If ResponseText <> '' then
-            MediaServerURLSaveCache(ServerURL+URLPath,ResponseText);
-
         Finally
           InternetCloseHandle(hReq);
         End;
@@ -604,44 +676,102 @@ begin
     oJSON := SO(ResponseText);
     If oJSON <> nil then
     Begin
-      idCount := oJSON.I['TotalRecordCount'];
-      If idCount > 0 then
-      Begin
-        oItems := oJson.O['Items'];
-
-        If oItems <> nil then
+      Case ServerType of
+        mediaServerEmby,
+        mediaServerJellyfin :
         Begin
-          For I := 0 to idCount-1 do
+          idCount := oJSON.I['TotalRecordCount'];
+          If idCount > 0 then
           Begin
-            New(nEntry);
+            oItems := oJson.O['Items'];
 
-            nEntry^.crID             := oItems.AsArray.O[I].S['Id'];
-            nEntry^.crName           := oItems.AsArray.O[I].S['Name'];
-            nEntry^.crIsFolder       := oItems.AsArray.O[I].B['IsFolder'];
-            nEntry^.crType           := oItems.AsArray.O[I].S['Type'];
-            nEntry^.crCollectionType := oItems.AsArray.O[I].S['CollectionType'];
+            If oItems <> nil then
+            Begin
+              For I := 0 to idCount-1 do
+              Begin
+                New(nEntry);
 
-            {$IFDEF CONTENTTRACE}
-            DebugMSGFT('c:\log\.MediaServerUtil.txt',CRLF+
-              'ID              : '+nEntry^.crID+CRLF+
-              'Name            : '+nEntry^.crName+CRLF+
-              'Type            : '+nEntry^.crType+CRLF+
-              'Collection Type : '+nEntry^.crCollectionType+CRLF+
-              'IsFolder        : '+BoolToStr(nEntry^.crIsFolder,True)+CRLF+
-            '-----------------');
-            {$ENDIF}
-            itemList.Add(nEntry);
+                nEntry^.crID             := oItems.AsArray.O[I].S['Id'];
+                nEntry^.crName           := oItems.AsArray.O[I].S['Name'];
+                nEntry^.crIsFolder       := oItems.AsArray.O[I].B['IsFolder'];
+                nEntry^.crType           := oItems.AsArray.O[I].S['Type'];
+                nEntry^.crCollectionType := oItems.AsArray.O[I].S['CollectionType'];
+
+                {$IFDEF CONTENTTRACE}
+                DebugMSGFT('c:\log\.MediaServerUtil.txt',CRLF+
+                  'ID              : '+nEntry^.crID+CRLF+
+                  'Name            : '+nEntry^.crName+CRLF+
+                  'Type            : '+nEntry^.crType+CRLF+
+                  'Collection Type : '+nEntry^.crCollectionType+CRLF+
+                  'IsFolder        : '+BoolToStr(nEntry^.crIsFolder,True)+CRLF+
+                '-----------------');
+                {$ENDIF}
+                itemList.Add(nEntry);
+              End;
+              oItems.Clear(True);
+              oItems := nil;
+            End
+              else
+            Begin
+              {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','oItems = NIL');{$ENDIF}
+            End;
+          End
+            else
+          Begin
+            {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','idCount = 0');{$ENDIF}
           End;
-          oItems.Clear(True);
-          oItems := nil;
         End;
-        oJSON.Clear(True);
-        oJSON := nil;
-      End
-        else
-      Begin
-        {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','idCount = 0');{$ENDIF}
-      End;
+        mediaServerPlex :
+        Begin
+          idCount := oJSON.I['MediaContainer.size'];
+          If idCount > 0 then
+          Begin
+            oItems := oJson.O['MediaContainer.Directory'];
+
+            If oItems <> nil then
+            Begin
+              For I := 0 to idCount-1 do
+              Begin
+                New(nEntry);
+
+                nEntry^.crID             := oItems.AsArray.O[I].S['key'];
+                nEntry^.crName           := oItems.AsArray.O[I].S['title'];
+                nEntry^.crIsFolder       := oItems.AsArray.O[I].B['directory'];
+                nEntry^.crType           := oItems.AsArray.O[I].S['agent'];
+                nEntry^.crCollectionType := oItems.AsArray.O[I].S['type'];
+
+                {$IFDEF CONTENTTRACE}
+                DebugMSGFT('c:\log\.MediaServerUtil.txt',CRLF+
+                  'ID              : '+nEntry^.crID+CRLF+
+                  'Name            : '+nEntry^.crName+CRLF+
+                  'Agent           : '+nEntry^.crType+CRLF+
+                  'Collection Type : '+nEntry^.crCollectionType+CRLF+
+                  'IsFolder        : '+BoolToStr(nEntry^.crIsFolder,True)+CRLF+
+                '-----------------');
+                {$ENDIF}
+                itemList.Add(nEntry);
+              End;
+              oItems.Clear(True);
+              oItems := nil;
+            End
+              else
+            Begin
+              {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','oItems = NIL');{$ENDIF}
+            End;
+          End
+            else
+          Begin
+            {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','idCount = 0');{$ENDIF}
+          End;
+        End;
+      End; // Case
+
+      // Save cached reply if new items were successfully added
+      If itemList.Count > initialCount then
+        MediaServerURLSaveCache(ServerURL+URLPath,ResponseText);
+
+      oJSON.Clear(True);
+      oJSON := nil;
     End
       else
     Begin
@@ -653,7 +783,7 @@ begin
 end;
 
 
-procedure MediaServerGetMediaFromParentID(const ServerURL : String; const ServerType : Integer; const UserId, ParentID, AccessToken : String; itemList : TList; IgnoreCache : Boolean);
+procedure MediaServerGetMediaFromParentID(ServerURL : String; const ServerType : Integer; const UserId, ParentID, AccessToken : String; itemList : TList; IgnoreCache : Boolean);
 var
   oJSON              : ISuperObject;
   oItems             : ISuperObject;
@@ -681,15 +811,31 @@ var
   URLParts           : TURLComponents;
   nEntry             : PMediaServerMediaRecord;
   sHeaders           : String;
+  initialCount       : Integer;
 
 begin
   {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','MediaServerGetMediaFromParentID (before)');{$ENDIF}
+
+  initialCount := itemList.Count;
+
+  If (ServerType = mediaServerPlex) then
+  Begin
+    // Apply Plex local port if no port is specified
+    I := Pos('://',ServerURL);
+    If I = 0 then I := Pos(':',ServerURL) else I := PosEx(':',ServerURL,I+3);
+    If I = 0 then
+    Begin
+      ServerURL := RemoveFrontSlash(ServerURL)+':'+IntToStr(plexPort);
+    End;
+  End;
+
   {$IFDEF TRACEDEBUG}
   DebugMSGFT('c:\log\.MediaServerUtil.txt','Server URL    : '+ServerURL);
   DebugMSGFT('c:\log\.MediaServerUtil.txt','User ID       : '+UserID);
   DebugMSGFT('c:\log\.MediaServerUtil.txt','Parent ID     : '+ParentID);
   DebugMSGFT('c:\log\.MediaServerUtil.txt','Auth Token    : '+AccessToken);
   {$ENDIF}
+
   ResponseText := '';
 
   hInet := InternetOpen(PChar(AppName), INTERNET_OPEN_TYPE_PRECONFIG, nil, nil, 0);
@@ -748,6 +894,12 @@ begin
       End;
       mediaServerPlex :
       Begin
+        If Pos ('/',ParentID) = 0 then
+          URLPath  := URLPath + 'library/sections/'+ParentID+'/all' else
+          URLPath  := RemoveFrontSlash(URLPath) + ParentID;
+
+        sHeaders := 'X-Plex-Token: '+AccessToken+CRLF+
+                    'Accept: application/json';
       End;
     End;
 
@@ -825,9 +977,6 @@ begin
           Until BytesRead = 0;
           {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','Server response: '+CRLF+ResponseText+CRLF);{$ENDIF}
 
-          If ResponseText <> '' then
-            MediaServerURLSaveCache(ServerURL+URLPath,ResponseText);
-
         Finally
           InternetCloseHandle(hReq);
         End;
@@ -851,53 +1000,119 @@ begin
     oJSON := SO(ResponseText);
     If oJSON <> nil then
     Begin
-      idCount := oJSON.I['TotalRecordCount'];
-      If idCount > 0 then
-      Begin
-        oItems := oJson.O['Items'];
-
-        If oItems <> nil then
+      Case ServerType of
+        mediaServerEmby,
+        mediaServerJellyfin :
         Begin
-          For I := 0 to idCount-1 do
+          idCount := oJSON.I['TotalRecordCount'];
+          If idCount > 0 then
           Begin
-            New(nEntry);
+            oItems := oJson.O['Items'];
 
-            nEntry^.mrID              := oItems.AsArray.O[I].S['Id'];
-            nEntry^.mrName            := oItems.AsArray.O[I].S['Name'];
-            nEntry^.mrRunTimeTicks    := oItems.AsArray.O[I].I['RunTimeTicks'];
-            nEntry^.mrIsFolder        := oItems.AsArray.O[I].B['IsFolder'];
-            nEntry^.mrType            := oItems.AsArray.O[I].S['Type'];
-            nEntry^.mrImagePrimaryID  := oItems.AsArray.O[I].S['ImageTags.Primary'];
+            If oItems <> nil then
+            Begin
+              For I := 0 to idCount-1 do
+              Begin
+                New(nEntry);
 
-            If oItems.AsArray.O[I].A['BackdropImageTags'].Length > 0 then
-              nEntry^.mrImageBackdropID := oItems.AsArray.O[I].A['BackdropImageTags'].S[0] else
-              nEntry^.mrImageBackdropID := '';
+                nEntry^.mrID              := oItems.AsArray.O[I].S['Id'];
+                nEntry^.mrName            := oItems.AsArray.O[I].S['Name'];
+                nEntry^.mrRunTimeTicks    := oItems.AsArray.O[I].I['RunTimeTicks'];
+                nEntry^.mrIsFolder        := oItems.AsArray.O[I].B['IsFolder'];
+                nEntry^.mrType            := oItems.AsArray.O[I].S['Type'];
+                nEntry^.mrImagePrimaryID  := oItems.AsArray.O[I].S['ImageTags.Primary'];
+
+                If oItems.AsArray.O[I].A['BackdropImageTags'].Length > 0 then
+                  nEntry^.mrImageBackdropID := oItems.AsArray.O[I].A['BackdropImageTags'].S[0] else
+                  nEntry^.mrImageBackdropID := '';
 
 
-            {$IFDEF CONTENTTRACE}
-            DebugMSGFT('c:\log\.MediaServerUtil.txt',CRLF+
-              'ID              : '+nEntry^.mrID+CRLF+
-              'Name            : '+nEntry^.mrName+CRLF+
-              'RunTimeTicks    : '+IntToStr(nEntry^.mrRunTimeTicks)+CRLF+
-              'Type            : '+nEntry^.mrType+CRLF+
-              'ImagePrimaryID  : '+nEntry^.mrImagePrimaryID+CRLF+
-              'ImageBackdropID : '+nEntry^.mrImageBackdropID+CRLF+
-              'IsFolder        : '+BoolToStr(nEntry^.mrIsFolder,True)+CRLF+
-              '-----------------');
-            {$ENDIF}
+                {$IFDEF CONTENTTRACE}
+                DebugMSGFT('c:\log\.MediaServerUtil.txt',CRLF+
+                  'ID              : '+nEntry^.mrID+CRLF+
+                  'Name            : '+nEntry^.mrName+CRLF+
+                  'RunTimeTicks    : '+IntToStr(nEntry^.mrRunTimeTicks)+CRLF+
+                  'Type            : '+nEntry^.mrType+CRLF+
+                  'ImagePrimaryID  : '+nEntry^.mrImagePrimaryID+CRLF+
+                  'ImageBackdropID : '+nEntry^.mrImageBackdropID+CRLF+
+                  'IsFolder        : '+BoolToStr(nEntry^.mrIsFolder,True)+CRLF+
+                  '-----------------');
+                {$ENDIF}
 
-            itemList.Add(nEntry);
+                itemList.Add(nEntry);
+              End;
+              oItems.Clear(True);
+              oItems := nil;
+            End
+              else
+            Begin
+              {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','oItems = NIL');{$ENDIF}
+            End;
+          End
+            else
+          Begin
+            {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','idCount = 0');{$ENDIF}
           End;
-          oItems.Clear(True);
-          oItems := nil;
         End;
-        oJSON.Clear(True);
-        oJSON := nil;
-      End
-        else
-      Begin
-        {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','idCount = 0');{$ENDIF}
-      End;
+        mediaServerPlex :
+        Begin
+          idCount := oJSON.I['MediaContainer.size'];
+          If idCount > 0 then
+          Begin
+            oItems := oJSON.O['MediaContainer.Metadata'];
+
+            If oItems <> nil then
+            Begin
+              For I := 0 to idCount-1 do
+              Begin
+                New(nEntry);
+
+                nEntry^.mrName            := oItems.AsArray.O[I].S['title'];
+                nEntry^.mrRunTimeTicks    := oItems.AsArray.O[I].I['duration'];
+                nEntry^.mrIsFolder        := oItems.AsArray.O[I].I['leafCount'] > 0;
+                nEntry^.mrType            := oItems.AsArray.O[I].S['agent'];
+                nEntry^.mrImagePrimaryID  := oItems.AsArray.O[I].S['thumb'];
+                nEntry^.mrImageBackdropID := oItems.AsArray.O[I].S['art'];
+
+                If nEntry^.mrIsFolder = False then
+                  nEntry^.mrID              := oItems.AsArray.O[I].S['ratingKey'] else
+                  nEntry^.mrID              := oItems.AsArray.O[I].S['key'];
+
+
+                {$IFDEF CONTENTTRACE}
+                DebugMSGFT('c:\log\.MediaServerUtil.txt',CRLF+
+                  'ID              : '+nEntry^.mrID+CRLF+
+                  'Name            : '+nEntry^.mrName+CRLF+
+                  'RunTimeTicks    : '+IntToStr(nEntry^.mrRunTimeTicks)+CRLF+
+                  'Type            : '+nEntry^.mrType+CRLF+
+                  'ImagePrimaryID  : '+nEntry^.mrImagePrimaryID+CRLF+
+                  'ImageBackdropID : '+nEntry^.mrImageBackdropID+CRLF+
+                  'IsFolder        : '+BoolToStr(nEntry^.mrIsFolder,True)+CRLF+
+                '-----------------');
+                {$ENDIF}
+                itemList.Add(nEntry);
+              End;
+              oItems.Clear(True);
+              oItems := nil;
+            End
+              else
+            Begin
+              {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','oItems = NIL');{$ENDIF}
+            End;
+          End
+            else
+          Begin
+            {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','idCount = 0');{$ENDIF}
+          End;
+        End;
+      End; // Case
+
+      // Save cached reply if new items were successfully added
+      If itemList.Count > initialCount then
+        MediaServerURLSaveCache(ServerURL+URLPath,ResponseText);
+
+      oJSON.Clear(True);
+      oJSON := nil;
     End
       else
     Begin
@@ -908,7 +1123,7 @@ begin
 end;
 
 
-function MediaServerGetMediaStreamInfo(const ServerURL : String; const ServerType : Integer; const UserId, ItemID, AccessToken : String) : String;
+function MediaServerGetMediaStreamInfo(ServerURL : String; const ServerType : Integer; const UserId, ItemID, AccessToken : String) : String;
 var
   oJSON              : ISuperObject;
   oMediaSources      : ISuperObject;
@@ -937,11 +1152,24 @@ var
   MediaID            : WideString;
   MediaContainer     : WideString;
   sHeaders           : String;
+  sStream            : String;
 
 
 
 begin
   {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','MediaServerGetMediaStreamInfo (before)');{$ENDIF}
+
+  If (ServerType = mediaServerPlex) then
+  Begin
+    // Apply Plex local port if no port is specified
+    I := Pos('://',ServerURL);
+    If I = 0 then I := Pos(':',ServerURL) else I := PosEx(':',ServerURL,I+3);
+    If I = 0 then
+    Begin
+      ServerURL := RemoveFrontSlash(ServerURL)+':'+IntToStr(plexPort);
+    End;
+  End;
+
   {$IFDEF TRACEDEBUG}
   DebugMSGFT('c:\log\.MediaServerUtil.txt','Server URL    : '+ServerURL);
   DebugMSGFT('c:\log\.MediaServerUtil.txt','User ID       : '+UserID);
@@ -993,9 +1221,6 @@ begin
     // *********************************************
     // *              Media Info Path              *
     // *********************************************
-    //URLPath := URLPath + 'emby/Items/'+MediaID+'/File';
-
-    //URLPath := URLPath + 'emby/Videos/'+MediaID+'/stream';
 
     Case ServerType of
       mediaServerEmby :
@@ -1010,6 +1235,9 @@ begin
       End;
       mediaServerPlex :
       Begin
+        URLPath := URLPath + 'library/metadata/'+ItemID;
+        sHeaders := 'X-Plex-Token: '+AccessToken+CRLF+
+                    'Accept: application/json';
       End;
     End;
 
@@ -1089,34 +1317,75 @@ begin
           // *********************************************
           // *           Media Info Processing           *
           // *********************************************
-          // http://{server_address}/Videos/{ItemId}/stream.{Container}?static=true&MediaSourceId={MediaSourceId}
 
           oJSON := SO(ResponseText);
           If oJSON <> nil then
           Begin
-            oMediaSources := oJSON.O['MediaSources'];
-
-            If oMediaSources <> nil then
-            Begin
-              iCount := oMediaSources.AsArray.Length;
-              If iCount > 0 then
+            Case ServerType of
+              mediaServerEmby,
+              mediaServerJellyfin :
               Begin
-                // Using the first entry, not looking for any quality at the moment.
-                MediaID        := oMediaSources.AsArray[0].S['Id'];
-                MediaContainer := oMediaSources.AsArray[0].S['Container'];
+                oMediaSources := oJSON.O['MediaSources'];
 
-                Result := AddFrontSlash(ServerURL)+'Videos/'+ItemID+'/stream.'+MediaContainer+'?static=true&MediaSourceId='+MediaID+'&X-Emby-Token='+AccessToken;
+                If oMediaSources <> nil then
+                Begin
+                  iCount := oMediaSources.AsArray.Length;
+                  If iCount > 0 then
+                    For I := 0 to iCount-1 do
+                  Begin
+                    MediaID        := oMediaSources.AsArray[I].S['Id'];
+                    MediaContainer := oMediaSources.AsArray[I].S['Container'];
+                    sStream        := AddFrontSlash(ServerURL)+'Videos/'+ItemID+'/stream.'+MediaContainer+'?static=true&MediaSourceId='+MediaID+'&X-Emby-Token='+AccessToken;
 
-                {$IFDEF CONTENTTRACE}
-                DebugMSGFT('c:\log\.MediaServerStream.txt',CRLF+
-                  'Media Name      : '+oMediaSources.AsArray[0].S['Name']+CRLF+
-                  'Media ID        : '+MediaID+CRLF+
-                  'Stream          : '+Result+CRLF+
-                  '-----------------');
-                {$ENDIF}
+                    {$IFDEF CONTENTTRACE}
+                    DebugMSGFT('c:\log\.MediaServerStream.txt',CRLF+
+                      'Media Name      : '+oMediaSources.AsArray[I].S['Name']+CRLF+
+                      'Media ID        : '+MediaID+CRLF+
+                      'Stream          : '+sStream+CRLF+
+                      '-----------------');
+                    {$ENDIF}
+
+                    If Result = '' then
+                      Result := sStream else
+                      Result := Result+'|'+sStream;
+                  End;
+                  oMediaSources.Clear(True);
+                  oMediaSources := nil;
+                End
+                  else
+                Begin
+                  {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','oMediaSources = NIL');{$ENDIF}
+                End;
               End;
-              oMediaSources.Clear(True);
-              oMediaSources := nil;
+              mediaServerPlex :
+              Begin
+                oMediaSources := oJSON.O['MediaContainer.Metadata[0].Media[0].Part'];
+
+                If oMediaSources <> nil then
+                Begin
+                  iCount := oMediaSources.AsArray.Length;
+                  If iCount > 0 then
+                    For I := 0 to iCount-1 do
+                  Begin
+                    MediaID := oMediaSources.AsArray[I].S['key'];
+                    sStream := RemoveFrontSlash(ServerURL)+MediaID+'?X-Plex-Token='+AccessToken;
+                    {$IFDEF CONTENTTRACE}
+                    DebugMSGFT('c:\log\.MediaServerStream.txt',CRLF+
+                      'Media ID        : '+MediaID+CRLF+
+                      'Stream          : '+sStream+CRLF+
+                      '-----------------');
+                    {$ENDIF}
+
+                    If Result = '' then
+                      Result := sStream else
+                      Result := Result+'|'+sStream;
+                  End;
+                End
+                  else
+                Begin
+                  {$IFDEF TRACEDEBUG}DebugMSGFT('c:\log\.MediaServerUtil.txt','oMediaSources = NIL');{$ENDIF}
+                End;
+              End;
             End;
 
             oJSON.Clear(True);
