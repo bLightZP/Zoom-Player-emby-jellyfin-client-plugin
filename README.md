@@ -1,9 +1,18 @@
 The Delphi helper functions used by Zoom Player to communicate with Emby and Jellyfin media servers.
 
-The following actions are supported:
+The following functions are supported:
 
-1. Authentication with the Server.
-2. Listing the media library's available collections/folders.
-3. Listing the contents of collections / media folders.
-4. Constructing a playable stream URL derived from an ItemID extracted from previously listed content.
-5. Caching the result for a specified number of days.
+**MediaServerAuthenticate**    
+Authentication with the Server.
+
+**MediaServerGetAvailableCategoryIDs**    
+Lists top-level media library folders/collections/categories.
+
+**MediaServerGetMediaFromParentID**    
+Lists the content of media folders and sub-folders.
+
+**MediaServerGetMediaStreamInfo**    
+Constructing a playable stream URL derived from an ItemID extracted from previously listed media.
+
+**Caching**    
+For faster operations, network data is optionally cached for a specified number of days.
