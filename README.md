@@ -1,5 +1,5 @@
 # Introduction
-I wrote helper functions for Zoom Player to communicate with Plex, Emby and Jellyfin media servers using an abstraction layer to make access as easy as possible.
+Helper functions to communicate with Plex, Emby and Jellyfin media servers using an abstraction layer to make access as easy as possible.
 
 The following functions are supported:
 
